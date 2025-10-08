@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>OSRM ナビ（PWA）</title>
+
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<style>
+  html,body{height:100%;margin:0;}
+  body {display:flex; height:100vh; overflow:hidden; font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;}
+  #map {flex:1; transition: all 0.3s;}
+  #sidebar {
+    width: 160px; background:#fafafa; box-shadow: 0 0 6px rgba(0,0,0,0.08);
+    display:flex;flex-direction:column; transition: width .25s; z-index:1000;
+  }
+  #sidebar.collapsed{width:24px;}
+  #sidebar-header{height:36px; background:#eee; display:flex;align-items:center;justify-content:space-between;padding:0 8px;box-sizing:border-box;}
+  #toggle-sidebar{background:rgba(0,0,0,0.7);color:#fff;border:none;padding:4px 6px;border-radius:4px;cursor:pointer;font-size:12px;}
+  #sidebar-content{padding:8px; overflow:auto; font-size:13px;}
+  input[type="file"]{display:none;}
+  ul{padding:0;margin:0; list-style:none;}
+  li{display:flex;justify-content:space-between;align-items:center;padding:4px;background:#eee;margin-bottom:6px;border-radius:4px;}
+  button, input, select {width:100%; padding:6px; margin-top:6px; box-sizing:border-box;}
+  .small {font-size:12px;padding:4px;}
+  #navi-status{margin-top:8px;font-weight:bold;color:#0a7;}
+  #controls-row{display:flex;gap:6px;}
+  #controls-row button{flex:1;}
+  .muted{color:#666;font-size:12px;}
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div id="sidebar-header">
+    <div>ルート設定</div>
+    <button id="toggle-sidebar">◀</button>
+  </div>
+
+  <div id="sidebar-content">
+    <p class="muted">地図をタップして地点を追加（順に経由点になります）</p>
+
+    <label class="small">スタート:
+      <select id="start-select">
+        <option value="gps">現在地（GPS）</option>
+        <option value="firstpoint">ポイント1</option>
+      </select>
+    </label>
+
+    <h4>地点リスト</h4>
+    <ul id="point-list"></ul>
+
+    <div id="controls-row">
+      <button id="clear-all" class="small">クリア</button>
+      <button id="undo" class="small">1つ戻す</button>
+    </div>
+
+    <button id="save-route" class="small">ルート保存 (JSON)</button>
+    <button id="load-route" class="small">ルート読み込み</button>
+    <input id="file-input" type="file" accept=".json">
+
+    <button id="start-navi" class="small">NAVI 開始</button>
+    <div id="navi-status" class="small">未開始</div>
+
+    <div style="margin-top:8px;">
+      <div class="muted small">次の案内:</div>
+      <div id="next-instruction" class="small">—</div>
+      <div class="muted small" style="margin-top:6px">現在地 → 目的地 距離:</div>
+      <div id="distance-to-dest" class="small">—</div>
+    </div>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+/* -----------------------
+   初期地図
+   -----------------------*/
+const map = L.map('map').setView([35.681236,139.767125], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution: ''}).addTo(map);
+
+/* -----------------------
+   状態変数
+   -----------------------*/
+let points = []; // {lat,lng,name,marker}
+let routeLine = L.polyline([], {color:'blue', weight:4}).addTo(map);
+let currentMarker = null;
+let watchId = null;
+let navigating = false;
+let voiceEnabled = true;
+let nextIndex = 0; // ナビ中の次の目的地インデックス
+
+/* DOM */
+const pointList = document.getElementById('point-list');
+const naviStatus = document.getElementById('navi-status');
+const nextInstruction = document.getElementById('next-instruction');
+const distanceToDest = document.getElementById('distance-to-dest');
+const startSelect = document.getElementById('start-select');
+
+/* サイドバー 折りたたみ */
+const sidebar = document.getElementById('sidebar');
+document.getElementById('toggle-sidebar').addEventListener('click', ()=>{
+  sidebar.classList.toggle('collapsed');
+  setTimeout(()=> map.invalidateSize(), 300);
+});
+
+/* -----------------------
+   地点追加/削除/表示
+   -----------------------*/
+map.on('click', e => addPoint(e.latlng));
+
+function addPoint(latlng){
+  const idx = points.length;
+  const name = `地点${idx+1}`;
+  const mk = L.marker(latlng).addTo(map).bindPopup(name);
+  mk.on('click', ()=> removePoint(idx));
+  const pt = {lat: latlng.lat, lng: latlng.lng, name, marker: mk};
+  points.push(pt);
+  updateList();
+  drawRoute();
+}
+
+function removePoint(i){
+  if(!points[i]) return;
+  map.removeLayer(points[i].marker);
+  points.splice(i,1);
+  // 再バインド（クリック時に正しいindexをとるため）
+  points.forEach((p, j)=> {
+    p.marker.off(); p.marker.on('click', ()=> removePoint(j));
+  });
+  updateList();
+  drawRoute();
+}
+
+function updateList(){
+  pointList.innerHTML = '';
+  points.forEach((pt,i)=>{
+    const li = document.createElement('li');
+    li.innerHTML = `<span style="cursor:pointer">${pt.name} (${pt.lat.toFixed(4)}, ${pt.lng.toFixed(4)})</span>`;
+    const btn = document.createElement('button');
+    btn.textContent = '×';
+    btn.addEventListener('click', ()=> removePoint(i));
+    li.appendChild(btn);
+    pointList.appendChild(li);
+  });
+}
+
+/* -----------------------
+   ルート取得（OSRM）と描画
+   -----------------------*/
+async function drawRoute(){
+  routeLine.setLatLngs([]);
+  if(points.length===0) return;
+
+  // start を決める
+  let start = null;
+  if(startSelect.value === 'gps'){
+    if(!currentMarker){
+      naviStatus.textContent = '現在地未取得';
+      // 位置がなければ、OSRM呼ばずにポイントのみで表示しない
+      return;
+    }
+    start = currentMarker.getLatLng();
+  } else { // firstpoint
+    start = L.latLng(points[0].lat, points[0].lng);
+  }
+
+  let allPoints = (startSelect.value === 'gps')
+    ? [[start.lat, start.lng], ...points.map(p=>[p.lat,p.lng])]
+    : points.map(p=>[p.lat,p.lng]);
+
+  if(allPoints.length < 2) return;
+
+  const coordStr = allPoints.map(p=>`${p[1]},${p[0]}`).join(';');
+  const url = `https://router.project-osrm.org/route/v1/driving/${coordStr}?geometries=geojson`;
+
+  try{
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('ルート取得失敗');
+    const data = await res.json();
+    if(!data.routes || data.routes.length===0) { alert('ルートが見つかりません'); return; }
+    const routeCoords = data.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);
+    routeLine.setLatLngs(routeCoords);
+    map.fitBounds(routeLine.getBounds(), {padding:[20,20]});
+    naviStatus.textContent = 'ルート更新完了';
+  }catch(err){
+    console.error(err);
+    alert('ルート取得エラー: '+err.message);
+  }
+}
+
+/* -----------------------
+   保存 / 読み込み
+   -----------------------*/
+document.getElementById('save-route').addEventListener('click', ()=>{
+  if(points.length===0){ alert('保存するルートがありません'); return; }
+  const saveData = points.map(pt=>({lat:pt.lat, lng:pt.lng, name:pt.name}));
+  const jsonStr = JSON.stringify(saveData, null, 2);
+  const blob = new Blob([jsonStr], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'route.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+const fileInput = document.getElementById('file-input');
+document.getElementById('load-route').addEventListener('click', ()=> fileInput.click());
+fileInput.addEventListener('change', e=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = ev=>{
+    try{
+      const arr = JSON.parse(ev.target.result);
+      if(!Array.isArray(arr)){ alert('無効なルートファイル'); return; }
+      // 既存マーカー削除
+      points.forEach(p=> map.removeLayer(p.marker));
+      points = [];
+      arr.forEach((pt,i)=>{
+        const mk = L.marker([pt.lat, pt.lng]).addTo(map).bindPopup(pt.name || `地点${i+1}`);
+        mk.on('click', ()=> removePoint(i));
+        points.push({lat:pt.lat, lng:pt.lng, name:pt.name || `地点${i+1}`, marker: mk});
+      });
+      updateList();
+      drawRoute();
+      alert('ルートを読み込みました');
+    }catch(err){ alert('ファイル読み込みエラー: '+err.message); }
+  };
+  reader.readAsText(f);
+  fileInput.value = '';
+});
+
+/* -----------------------
+   GPS 追跡 / ナビ機能
+   -----------------------*/
+function toRad(d){ return d*Math.PI/180; }
+function haversine(lat1, lon1, lat2, lon2){
+  const R = 6371000;
+  const dLat = toRad(lat2-lat1);
+  const dLon = toRad(lon2-lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  const c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R*c;
+}
+function bearing(lat1, lon1, lat2, lon2){
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const λ1 = toRad(lon1), λ2 = toRad(lon2);
+  const y = Math.sin(λ2-λ1)*Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(λ2-λ1);
+  return ( (Math.atan2(y,x)*180/Math.PI)+360 ) % 360;
+}
+
+function startWatchPosition(){
+  if(!('geolocation' in navigator)){ alert('このブラウザでは位置情報が使えません'); return; }
+  if(watchId !== null) return;
+
+  watchId = navigator.geolocation.watchPosition(pos=>{
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    // 現在地マーカー
+    if(!currentMarker){
+      currentMarker = L.marker([lat,lon], {
+        icon: L.icon({
+          iconUrl: 'https://maps.gstatic.com/mapfiles/ms2/micons/red-dot.png',
+          iconSize:[32,32], iconAnchor:[16,32]
+        })
+      }).addTo(map).bindPopup('現在地');
+      map.setView([lat,lon], 16);
+    }else{
+      currentMarker.setLatLng([lat,lon]);
+    }
+
+    if(navigating){
+      followNavigation([lat,lon]);
+    } else {
+      // もし startが 'gps' なら常にルート更新
+      if(startSelect.value === 'gps'){
+        drawRoute();
+      }
+    }
+  }, err=>{
+    console.error('位置情報エラー', err);
+    if(err.code === 1) alert('位置情報の使用を許可してください');
+  }, {enableHighAccuracy:true, maximumAge: 1000, timeout: 10000});
+}
+
+function stopWatchPosition(){
+  if(watchId !== null){
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+  }
+}
+
+function speak(text){
+  if(!voiceEnabled) return;
+  try{
+    const ut = new SpeechSynthesisUtterance(text);
+    ut.lang = 'ja-JP';
+    speechSynthesis.cancel();
+    speechSynthesis.speak(ut);
+  }catch(e){ console.warn('音声案内エラー', e); }
+}
+
+/* ナビロジック：現在地 → 次の waypoint（points[nextIndex]）までの距離チェック */
+function followNavigation(currentLatLng){
+  if(points.length === 0){ nextInstruction.textContent = '目的地がありません'; return; }
+
+  // ナビ対象の配列（開始位置がgpsなら points[0]が1つ目の経由点）
+  // nextIndex は現在ナビ中の「次の目的地（points配列のindex）」を指す
+  if(nextIndex >= points.length){
+    // 到着
+    naviStatus.textContent = '到着';
+    nextInstruction.textContent = '到着しました';
+    distanceToDest.textContent = '0 m';
+    speak('到着しました');
+    navigating = false;
+    return;
+  }
+
+  const curLat = currentLatLng[0], curLng = currentLatLng[1];
+  const target = points[nextIndex];
+  const dist = haversine(curLat, curLng, target.lat, target.lng); // meters
+  distanceToDest.textContent = `${(dist >= 1000) ? (dist/1000).toFixed(2)+' km' : Math.round(dist)+' m'}`;
+
+  const brg = bearing(curLat, curLng, target.lat, target.lng);
+  nextInstruction.textContent = `${target.name} まで ${(dist >= 1000)? (dist/1000).toFixed(2)+' km' : Math.round(dist)+' m'} （方位 ${Math.round(brg)}°）`;
+  naviStatus.textContent = `進行中（${nextIndex+1}/${points.length}）`;
+
+  // 案内音声・次に切り替える閾値
+  if(dist < 20){ // 20m 以内で次へ
+    speak(`${target.name} に到着しました`);
+    nextIndex++;
+  } else if(dist < 100 && Math.random() < 0.02){ // 100m 内でたまにリマインド（乱数で過剰喋りを防止）
+    speak(`${target.name} まで ${(dist >= 1000)? (dist/1000).toFixed(2)+'キロ' : Math.round(dist)+'メートル'}`);
+  }
+
+  // Optional: もしルート（routeLine）があるなら地図を自動でセンターに
+  if(routeLine && routeLine.getLatLngs().length>0){
+    // map.panTo([curLat, curLng], {animate:true});
+  }
+}
+
+/* NAVI 開始/停止 ボタン */
+document.getElementById('start-navi').addEventListener('click', ()=>{
+  if(!navigating){
+    if(points.length === 0){ alert('ルートがありません'); return; }
+    navigating = true;
+    // startIndex: 現在地 をスタートにする場合は nextIndex=0、
+    // start select が firstpoint のときは nextIndex = 1（つまり 1番目を基準に）
+    nextIndex = 0;
+    // もし startSelect が 'firstpoint' なら points[0] を出発点として扱い、次は points[1]
+    if(startSelect.value === 'firstpoint') nextIndex = 1;
+
+    naviStatus.textContent = 'ナビ開始';
+    speak('ナビを開始します');
+    // ルートを再計算（GPS起点のときは現在地取得に依存）
+    drawRoute();
+    startWatchPosition();
+  } else {
+    navigating = false;
+    naviStatus.textContent = 'ナビ停止';
+    speak('ナビを停止しました');
+    // 位置ウォッチは継続しておきたい場合は stopWatchPosition を呼ばない
+    // stopWatchPosition();
+  }
+});
+
+/* クリア / undo */
+document.getElementById('clear-all').addEventListener('click', ()=>{
+  points.forEach(p=> map.removeLayer(p.marker));
+  points = [];
+  updateList();
+  routeLine.setLatLngs([]);
+});
+document.getElementById('undo').addEventListener('click', ()=>{
+  if(points.length===0) return;
+  const p = points.pop();
+  map.removeLayer(p.marker);
+  updateList();
+  drawRoute();
+});
+
+/* 開始地点選択が変わったらルート再描画 */
+startSelect.addEventListener('change', ()=> drawRoute());
+
+/* 現在地を最初に取得しておく（ページ開き時に位置の許可を求める） */
+if('geolocation' in navigator){
+  navigator.geolocation.getCurrentPosition(pos=>{
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    currentMarker = L.marker([lat,lon], {
+      icon: L.icon({iconUrl:'https://maps.gstatic.com/mapfiles/ms2/micons/red-dot.png', iconSize:[32,32], iconAnchor:[16,32]})
+    }).addTo(map).bindPopup('現在地');
+    map.setView([lat,lon], 15);
+  }, err=>{
+    console.warn('初回位置取得エラー', err);
+  }, {enableHighAccuracy:true, timeout:10000});
+}
+
+/* ページアンロード時はwatchを解除（オプション） */
+window.addEventListener('beforeunload', ()=> {
+  if(watchId !== null) navigator.geolocation.clearWatch(watchId);
+});
+
+/* 初期ボタンバインド：ルートの自動再描画を利用者が使えるように */
+document.getElementById('save-route').classList.add('small');
+document.getElementById('load-route').classList.add('small');
+
+/* service worker 登録 */
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('service-worker.js').then(reg=>{
+    console.log('SW registered', reg);
+  }).catch(err=> console.warn('SW登録失敗', err));
+}
+
+/* 初期 UI 更新 */
+updateList();
+drawRoute();
+</script>
+</body>
+</html>
